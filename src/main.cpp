@@ -6,7 +6,7 @@ const char *ssid = "RC_Car_AP";
 const char *password = "12345678";
 
 #define VRY_MOVE_PIN 34 // Y-axis analog pin
-#define VRX_MOVE_PIN 25 // X-axis analog pin
+#define VRX_MOVE_PIN 35 // X-axis analog pin
 
 #define FORWARD_THRESHOLD 2800
 #define BACKWARD_THRESHOLD 3100
