@@ -1,6 +1,3 @@
-// espnow_tx_final_tuned.ino
-// Robust ESP-NOW joystick transmitter — dominance tie-break tuned to prefer the intended axis
-
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
@@ -63,11 +60,10 @@ void printMac(const uint8_t *mac) {
 }
 
 void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
-  // kept for debug — safe to ignore status lines
   Serial.print("Send to ");
   printMac(mac_addr);
-  Serial.print(" status=");
-  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "OK" : "ERR");
+  //Serial.print(" status=");
+  //Serial.println(status == ESP_NOW_SEND_SUCCESS ? "OK" : "ERR");
 }
 
 bool ensureEspNowPeer() {
