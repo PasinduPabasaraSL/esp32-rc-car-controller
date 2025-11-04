@@ -1,56 +1,110 @@
+// vectormap_joystick_with_espnow.ino
 #include <Arduino.h>
+#include <math.h>
 #include <WiFi.h>
 #include <esp_now.h>
 
-#define VRX_MOVE_PIN 35
-#define VRY_MOVE_PIN 34
-#define SW_PIN 12
+// pins
+#define PIN_X 35
+#define PIN_Y 34
+#define PIN_SW 12
 
-// Sampling & smoothing
-const int MEDIAN_WINDOW = 5;   // must be odd
-const int AVG_SAMPLES = 5;
-const int SAMPLE_DELAY_MS = 4;
-int xBuf[MEDIAN_WINDOW];
-int yBuf[MEDIAN_WINDOW];
-
-// Spike and ADC
+// ADC
 const int ADC_MAX = 4095;
-const int SPIKE_DELTA = 1000;  // if a reading jumps > this to 0/4095, treat as spike
 
-// Deadzone & thresholds
-const int DEADZONE = 260;         // ignore small noise
-const int HORIZ_MIN = 400;        // minimum dx magnitude to consider horizontal significant
-const int VERT_MIN  = 400;        // minimum dy magnitude to consider vertical significant
-const int DOM_TOLERANCE = 50;     // small allowance so near-ties prefer the intended axis
+// Filtering
+const int AVG_SAMPLES = 5;      // small average
+const int MEDIAN_WINDOW = 5;    // median window (odd)
+const int SPIKE_DELTA = 1000;   // treat sudden 0/4095 as spike if jump > this
 
-const int FORWARD_OFFSET = -700;
-const int BACKWARD_OFFSET = 700;
-const int LEFT_OFFSET = -600;
-const int RIGHT_OFFSET = 600;
-const int Y_ALLOW_FOR_TURN = 220; // fallback small band to allow turns
+// Hysteresis / thresholds (normalized)
+const float ENTER_MAG = 0.35f;  // magnitude to decide movement (0..~1)
+const float EXIT_MAG  = 0.25f;  // magnitude to return to stop
 
-// Timing
-unsigned long lastSendMs = 0;
-const unsigned long minSendInterval = 80;
-char lastSent = 0;
+// Angular hysteresis in degrees
+const float ANGLE_HYST = 15.0f; // degrees tolerance used when near sector boundaries
 
-// Receiver MAC (your device)
+// buffers
+int avgBufX[AVG_SAMPLES], avgBufY[AVG_SAMPLES];
+int medBufX[MEDIAN_WINDOW], medBufY[MEDIAN_WINDOW];
+
+// center (calibrated)
+int centerX = 0, centerY = 0;
+
+// previous median used for spike rejection
+int prevMedX = 0, prevMedY = 0;
+
+// state
+char lastCmd = 'S';
+
+// --- ESP-NOW peer MAC (user provided) ---
 uint8_t peerMac[] = { 0x20, 0xE7, 0xC8, 0x68, 0xB8, 0x30 };
 
-// Center calibration
-int centerX = 0;
-int centerY = 0;
-
-// Utility: median of small array
-int medianOfArray(int *arr, int size) {
+// helper: median
+int medianOfArray(int *arr, int n) {
   int tmp[MEDIAN_WINDOW];
-  for (int i = 0; i < size; ++i) tmp[i] = arr[i];
-  for (int i = 0; i < size - 1; ++i)
-    for (int j = i + 1; j < size; ++j)
+  for (int i = 0; i < n; ++i) tmp[i] = arr[i];
+  for (int i = 0; i < n - 1; ++i)
+    for (int j = i + 1; j < n; ++j)
       if (tmp[j] < tmp[i]) { int t = tmp[i]; tmp[i] = tmp[j]; tmp[j] = t; }
-  return tmp[size / 2];
+  return tmp[n/2];
 }
 
+void calibrateCenter(int samples = 40, int delayMs = 12) {
+  Serial.println("Calibrating center - keep joystick idle...");
+  long sx = 0, sy = 0;
+  for (int i = 0; i < samples; ++i) {
+    sx += analogRead(PIN_X);
+    sy += analogRead(PIN_Y);
+    delay(delayMs);
+  }
+  centerX = sx / samples;
+  centerY = sy / samples;
+  Serial.print("CenterX="); Serial.print(centerX);
+  Serial.print(" CenterY="); Serial.println(centerY);
+}
+
+float clampf(float v, float a, float b) { return (v < a) ? a : (v > b) ? b : v; }
+
+// normalize dx to [-1..1] using asymmetric ranges from center to edges
+float normalizeDx(int dx, int cx) {
+  if (dx >= 0) {
+    float r = (float)(ADC_MAX - cx);
+    if (r <= 1.0f) return 0.0f;
+    return (float)dx / r;
+  } else {
+    float r = (float)cx;
+    if (r <= 1.0f) return 0.0f;
+    return (float)dx / r; // negative
+  }
+}
+
+// normalize dy similarly
+float normalizeDy(int dy, int cy) {
+  if (dy >= 0) {
+    float r = (float)(ADC_MAX - cy);
+    if (r <= 1.0f) return 0.0f;
+    return (float)dy / r;
+  } else {
+    float r = (float)cy;
+    if (r <= 1.0f) return 0.0f;
+    return (float)dy / r;
+  }
+}
+
+// map angle (radians) to degrees [-180,180)
+float rad2deg(float r) { return r * 180.0f / M_PI; }
+
+// determine direction from angle (deg)
+char angleToDir(float angleDeg) {
+  if (angleDeg > -45.0f && angleDeg <= 45.0f) return 'R';
+  if (angleDeg > 45.0f && angleDeg <= 135.0f) return 'F';
+  if (angleDeg > 135.0f || angleDeg <= -135.0f) return 'L';
+  if (angleDeg > -135.0f && angleDeg <= -45.0f) return 'B';
+  return 'S';
+}
+
+// --- ESP-NOW helper: print MAC ---
 void printMac(const uint8_t *mac) {
   for (int i = 0; i < 6; ++i) {
     if (i) Serial.print(":");
@@ -59,170 +113,168 @@ void printMac(const uint8_t *mac) {
   }
 }
 
+// --- ESP-NOW send callback (optional debug) ---
 void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
-  Serial.print("Send to ");
+  Serial.print("ESP-NOW send status to ");
   printMac(mac_addr);
-  //Serial.print(" status=");
-  //Serial.println(status == ESP_NOW_SEND_SUCCESS ? "OK" : "ERR");
+  Serial.print(" -> ");
+  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "OK" : "ERR");
 }
 
-bool ensureEspNowPeer() {
+// Initialize ESP-NOW and add peer (non-fatal if fails)
+void initEspNowPeer() {
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
   delay(50);
   if (esp_now_init() != ESP_OK) {
-    esp_now_deinit();
-    delay(50);
-    if (esp_now_init() != ESP_OK) return false;
+    Serial.println("ESP-NOW init failed");
+  } else {
+    esp_now_register_send_cb(onDataSent);
+    esp_now_peer_info_t peerInfo = {};
+    memcpy(peerInfo.peer_addr, peerMac, 6);
+    peerInfo.channel = 0;
+    peerInfo.encrypt = false;
+    if (esp_now_is_peer_exist(peerInfo.peer_addr)) esp_now_del_peer(peerInfo.peer_addr);
+    if (esp_now_add_peer(&peerInfo) == ESP_OK) {
+      Serial.print("ESP-NOW peer added: ");
+      printMac(peerMac);
+      Serial.println();
+    } else {
+      Serial.println("Failed to add ESP-NOW peer");
+    }
   }
-  esp_now_register_send_cb(onDataSent);
-
-  esp_now_peer_info_t peerInfo = {};
-  memcpy(peerInfo.peer_addr, peerMac, 6);
-  peerInfo.channel = 0;
-  peerInfo.encrypt = false;
-
-  if (esp_now_is_peer_exist(peerInfo.peer_addr)) esp_now_del_peer(peerInfo.peer_addr);
-  return (esp_now_add_peer(&peerInfo) == ESP_OK);
 }
 
-void calibrateCenter() {
-  long sumX = 0, sumY = 0;
-  const int samples = 30;
-  Serial.println("Calibrating center - keep joystick idle");
-  for (int i = 0; i < samples; ++i) {
-    sumX += analogRead(VRX_MOVE_PIN);
-    sumY += analogRead(VRY_MOVE_PIN);
-    delay(12);
-  }
-  centerX = sumX / samples;
-  centerY = sumY / samples;
-  Serial.print("Calibrated centerX=");
-  Serial.print(centerX);
-  Serial.print(" centerY=");
-  Serial.println(centerY);
-}
-
-void sendCmd(char cmd, bool force = false) {
-  unsigned long now = millis();
-  if (!force) {
-    if (cmd == lastSent && (now - lastSendMs) < 1000) return;
-    if ((now - lastSendMs) < minSendInterval) return;
-  }
-  lastSent = cmd;
-  lastSendMs = now;
+// Send single-char command via ESP-NOW (non-blocking)
+void espNowSendCmd(char cmd) {
   esp_err_t res = esp_now_send(peerMac, (uint8_t*)&cmd, 1);
-  if (res == ESP_OK) Serial.print("Sent: "), Serial.println(cmd);
-  else Serial.print("esp_now_send err: "), Serial.println(res);
-}
-
-// read sensor: avg then median smoothing + simple spike reject
-int readFilteredAxis(int pin, int *buf) {
-  long sum = 0;
-  for (int i = 0; i < AVG_SAMPLES; ++i) {
-    sum += analogRead(pin);
-    delay(SAMPLE_DELAY_MS);
+  if (res != ESP_OK) {
+    // print minimal debug, do not alter logic
+    Serial.print("esp_now_send err: ");
+    Serial.println(res);
   }
-  int avg = sum / AVG_SAMPLES;
-
-  // shift buffer and append
-  for (int i = 0; i < MEDIAN_WINDOW - 1; ++i) buf[i] = buf[i + 1];
-  buf[MEDIAN_WINDOW - 1] = avg;
-
-  int med = medianOfArray(buf, MEDIAN_WINDOW);
-  int prev = buf[MEDIAN_WINDOW - 2];
-
-  // ignore single-sample saturations if they jump too much
-  if ((med == 0 || med == ADC_MAX) && abs(med - prev) > SPIKE_DELTA) {
-    return prev;
-  }
-  return med;
 }
 
 void setup() {
   Serial.begin(115200);
-  delay(100);
-  pinMode(SW_PIN, INPUT_PULLUP);
+  analogSetPinAttenuation(PIN_X, ADC_11db);
+  analogSetPinAttenuation(PIN_Y, ADC_11db);
+  pinMode(PIN_SW, INPUT_PULLUP);
 
-  analogSetPinAttenuation(VRX_MOVE_PIN, ADC_11db);
-  analogSetPinAttenuation(VRY_MOVE_PIN, ADC_11db);
+  // init buffers
+  for (int i = 0; i < AVG_SAMPLES; ++i) { avgBufX[i] = 0; avgBufY[i] = 0; }
+  for (int i = 0; i < MEDIAN_WINDOW; ++i) { medBufX[i] = 0; medBufY[i] = 0; }
 
   calibrateCenter();
-  for (int i = 0; i < MEDIAN_WINDOW; ++i) {
-    xBuf[i] = centerX;
-    yBuf[i] = centerY;
-  }
+  // initialize buffers with center
+  for (int i = 0; i < AVG_SAMPLES; ++i) { avgBufX[i] = centerX; avgBufY[i] = centerY; }
+  for (int i = 0; i < MEDIAN_WINDOW; ++i) { medBufX[i] = centerX; medBufY[i] = centerY; }
+  prevMedX = centerX; prevMedY = centerY;
+  delay(200);
+  Serial.println("Ready (vector normalization + hysteresis mode)");
 
-  if (!ensureEspNowPeer()) Serial.println("ESP-NOW init failed (will retry on send)");
-  else {
-    Serial.print("ESP-NOW peer ready: ");
-    printMac(peerMac);
-    Serial.println();
-  }
-  Serial.println("Ready");
+  // Initialize ESP-NOW (added)
+  initEspNowPeer();
 }
 
 void loop() {
-  int valueMoveX = readFilteredAxis(VRX_MOVE_PIN, xBuf);
-  int valueMoveY = readFilteredAxis(VRY_MOVE_PIN, yBuf);
-  int swState = digitalRead(SW_PIN);
+  // read raw samples and compute avg
+  static int avgPos = 0;
+  long sumx = 0, sumy = 0;
+  // average AVG_SAMPLES sequentially (simple rolling average)
+  avgBufX[avgPos] = analogRead(PIN_X);
+  avgBufY[avgPos] = analogRead(PIN_Y);
+  avgPos = (avgPos + 1) % AVG_SAMPLES;
+  for (int i = 0; i < AVG_SAMPLES; ++i) { sumx += avgBufX[i]; sumy += avgBufY[i]; }
+  int avgx = (int)(sumx / AVG_SAMPLES);
+  int avgy = (int)(sumy / AVG_SAMPLES);
 
-  if (swState == LOW) {
-    sendCmd('S', true);
-    delay(90);
+  // median smoothing
+  for (int i = 0; i < MEDIAN_WINDOW - 1; ++i) { medBufX[i] = medBufX[i + 1]; medBufY[i] = medBufY[i + 1]; }
+  medBufX[MEDIAN_WINDOW - 1] = avgx;
+  medBufY[MEDIAN_WINDOW - 1] = avgy;
+  int medx = medianOfArray(medBufX, MEDIAN_WINDOW);
+  int medy = medianOfArray(medBufY, MEDIAN_WINDOW);
+
+  // spike rejection: if median is exactly 0 or 4095 and previous was far away -> treat as spike
+  if ((medx == 0 || medx == ADC_MAX) && abs(medx - prevMedX) > SPIKE_DELTA) medx = prevMedX;
+  if ((medy == 0 || medy == ADC_MAX) && abs(medy - prevMedY) > SPIKE_DELTA) medy = prevMedY;
+
+  prevMedX = medx; prevMedY = medy;
+
+  // compute dx/dy relative to center
+  int dx = medx - centerX;
+  int dy = medy - centerY;
+
+  // normalize asymmetrically to [-1..1]
+  float dxn = normalizeDx(dx, centerX); // may be -1..1 (float)
+  float dyn = normalizeDy(dy, centerY);
+
+  // clamp to [-1,1]
+  dxn = clampf(dxn, -1.0f, 1.0f);
+  dyn = clampf(dyn, -1.0f, 1.0f);
+
+  // magnitude and angle
+  float mag = sqrtf(dxn * dxn + dyn * dyn);
+  float angRad = atan2f(-dyn, dxn); // -dyn so up = positive angle
+  float angDeg = rad2deg(angRad);
+
+  // button stops override
+  if (digitalRead(PIN_SW) == LOW) {
+    if (lastCmd != 'S') {
+      lastCmd = 'S';
+      Serial.println("CMD S (button)");
+      // send via ESP-NOW
+      espNowSendCmd('S');
+    }
+    delay(50);
     return;
   }
 
-  int dx = valueMoveX - centerX;
-  int dy = valueMoveY - centerY;
+  // hysteresis decision
+  char newCmd = 'S';
+  static float lastMag = 0.0f;
+  static float lastAng = 0.0f;
 
-  if (abs(dx) < DEADZONE) dx = 0;
-  if (abs(dy) < DEADZONE) dy = 0;
-
-  int absdx = abs(dx);
-  int absdy = abs(dy);
-
-  char cmd = 'S';
-
-  // If neither axis is significant, stop
-  if (absdx < HORIZ_MIN && absdy < VERT_MIN) {
-    cmd = 'S';
-  } else {
-    // Axis dominance with a small tie tolerance:
-    // prefer horizontal when absdx is nearly equal to absdy (within DOM_TOLERANCE)
-    if (absdx >= absdy - DOM_TOLERANCE && absdx >= HORIZ_MIN) {
-      // horizontal dominates (or tie)
-      if (dx < LEFT_OFFSET) cmd = 'L';
-      else if (dx > RIGHT_OFFSET) cmd = 'R';
-      else cmd = 'S';
-    } else if (absdy >= absdx - DOM_TOLERANCE && absdy >= VERT_MIN) {
-      // vertical dominates
-      if (dy < FORWARD_OFFSET) cmd = 'F';
-      else if (dy > BACKWARD_OFFSET) cmd = 'B';
-      else cmd = 'S';
-    } else {
-      // fallback: if vertical is small, allow horizontal; else vertical
-      if (absdy < Y_ALLOW_FOR_TURN) {
-        if (dx < LEFT_OFFSET) cmd = 'L';
-        else if (dx > RIGHT_OFFSET) cmd = 'R';
-        else cmd = 'S';
-      } else {
-        if (dy < FORWARD_OFFSET) cmd = 'F';
-        else if (dy > BACKWARD_OFFSET) cmd = 'B';
-        else cmd = 'S';
+  // use enter/exit magnitudes
+  if (mag >= ENTER_MAG) {
+    // determine direction by angle
+    newCmd = angleToDir(angDeg);
+    // if near boundary, apply small angular hysteresis: keep last if angle didn't move enough
+    if (lastCmd != 'S' && lastCmd != newCmd) {
+      float da = fabsf(angDeg - lastAng);
+      if (da > 180.0f) da = 360.0f - da;
+      if (da < ANGLE_HYST) {
+        // keep last direction
+        newCmd = lastCmd;
       }
     }
+  } else if (mag < EXIT_MAG) {
+    newCmd = 'S';
+  } else {
+    // between exit and enter: keep previous direction if any
+    newCmd = lastCmd;
   }
 
-  // debug output
-  // Serial.print("x="); Serial.print(valueMoveX);
-  // Serial.print(" y="); Serial.print(valueMoveY);
-  // Serial.print(" dx="); Serial.print(dx);
-  // Serial.print(" dy="); Serial.print(dy);
-  // Serial.print(" absdx="); Serial.print(absdx);
-  // Serial.print(" absdy="); Serial.print(absdy);
-  // Serial.print(" -> "); Serial.println(cmd);
+  // publish only when changed
+  if (newCmd != lastCmd) {
+    lastCmd = newCmd;
+    Serial.print("x="); Serial.print(medx);
+    Serial.print(" y="); Serial.print(medy);
+    Serial.print(" dx="); Serial.print(dx);
+    Serial.print(" dy="); Serial.print(dy);
+    Serial.print(" dxn="); Serial.print(dxn, 3);
+    Serial.print(" dyn="); Serial.print(dyn, 3);
+    Serial.print(" mag="); Serial.print(mag, 3);
+    Serial.print(" ang="); Serial.print(angDeg, 1);
+    Serial.print(" -> "); Serial.println(newCmd);
 
-  sendCmd(cmd);
-  delay(80);
+    // send via ESP-NOW (added)
+    espNowSendCmd(newCmd);
+  }
+
+  lastMag = mag;
+  lastAng = angDeg;
+
+  delay(25); // sampling interval (adjust as needed)
 }
