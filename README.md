@@ -17,8 +17,7 @@ Vector normalization, hysteresis, spike rejection, and ESP-NOW send — fixes as
 - [Quick start](#quick-start)  
 - [Calibration & tuning](#calibration--tuning)  
 - [Usage examples](#usage-examples)  
-- [Troubleshooting](#troubleshooting)  
-- [Contributing](#contributing)  
+- [Troubleshooting](#troubleshooting)   
 - [License](#license)
 
 ---
@@ -157,12 +156,6 @@ Solution: ensure you have the version that *flushes buffers on button press*. Th
 - If flicker persists at exact diagonal boundaries increase `ANGLE_HYST`.
 
 ---
-
-## Contributing
-1. Fork the repo and create a feature branch.  
-2. Add tests or serial logs for any behavioral changes.  
-3. Create a PR with a clear description, profiling data (if performance-sensitive), and why the change is needed.  
-4. Use Conventional Commits for commit messages, e.g. `feat(cal): improve normalization logic`.
 
 Suggested PR template:
 ```md
