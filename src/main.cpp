@@ -95,16 +95,14 @@ float normalizeDy(int dy, int cy) {
 // map angle (radians) to degrees [-180,180)
 float rad2deg(float r) { return r * 180.0f / M_PI; }
 
-// determine direction from angle (deg)
 char angleToDir(float angleDeg) {
-  if (angleDeg > -45.0f && angleDeg <= 45.0f) return 'R';
+  if (angleDeg > -45.0f && angleDeg <= 45.0f) return 'L';
   if (angleDeg > 45.0f && angleDeg <= 135.0f) return 'F';
-  if (angleDeg > 135.0f || angleDeg <= -135.0f) return 'L';
+  if (angleDeg > 135.0f || angleDeg <= -135.0f) return 'R';
   if (angleDeg > -135.0f && angleDeg <= -45.0f) return 'B';
   return 'S';
 }
 
-// --- ESP-NOW helper: print MAC ---
 void printMac(const uint8_t *mac) {
   for (int i = 0; i < 6; ++i) {
     if (i) Serial.print(":");
