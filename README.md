@@ -1,4 +1,4 @@
-# ESP32 Joystick - Robust Direction Sender (ESP-NOW)
+# ESP32 Remote Controller
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)  
 [![ESP32](https://img.shields.io/badge/platform-ESP32-orange.svg)]()  
